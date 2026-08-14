@@ -63,7 +63,7 @@ fn fallible_main() -> Result<bool> {
         .ok_or(anyhow!("Manifest path must have a parent."))?;
     // Putting marker file creation after the actual build command means that
     // we create less garbage if the build command failed.
-    create_package_marker(&args.install_base, "packages", package_name)?;
+    register_package(&args.install_base, package_name)?;
 
     // If this package should be included in ros-env, we do not want `colcon-ros-cargo` to
     // find the package as it should not be patched.
@@ -77,7 +77,7 @@ fn fallible_main() -> Result<bool> {
 
     if !include_ros_env {
         // This marker is used by colcon-ros-cargo when looking for dependencies
-        create_package_marker(&args.install_base, "rust_packages", package_name)?;
+        register_resource(&args.install_base, "rust_packages", package_name, "")?;
     }
 
     install_package(
@@ -98,6 +98,12 @@ fn fallible_main() -> Result<bool> {
         &manifest.bin,
     )?;
     install_files_from_metadata(
+        &args.install_base,
+        package_path,
+        package_name,
+        package.metadata.as_ref(),
+    )?;
+    install_ament_index_resources(
         &args.install_base,
         package_path,
         package_name,

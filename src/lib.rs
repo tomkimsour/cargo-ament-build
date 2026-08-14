@@ -6,6 +6,7 @@ use cargo_manifest::{Manifest, Product, StringOrBool, Value};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{DirBuilder, File};
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -125,24 +126,38 @@ pub fn cargo(args: &[OsString], verb: &str) -> Result<Option<i32>> {
     Ok(exit_status.code())
 }
 
-/// Create an ament resource index marker file for a package
+/// Register a package resource of a specific type with the ament index.
 ///
-/// This function registers a package to ament by creating an empty marker file at
-/// `share/ament_index/resource_index` with the package name as filename.  
+/// This is the direct Rust equivalent of CMake's
+/// `ament_index_register_resource(<resource_type> CONTENT <content>)`: it writes
+/// `content` verbatim to the marker file at
+/// `share/ament_index/resource_index/<resource_type>/<package_name>`. Pass an
+/// empty string for a plain presence marker (as used for the `packages` and
+/// `rust_packages` resource types); pass non-empty content for resource types
+/// that carry data (e.g. a list of related file paths). There is no single
+/// universal content format across resource types — each one is read back by
+/// its own consumer with its own convention (see [`install_ament_index_resources`]
+/// for examples) — so callers are responsible for formatting `content` to match
+/// whatever will read it.
 ///
-/// The presence of this file is used by ament and colcon to discover installed packages and other resources.
+/// This function (along with [`register_package`]) is public so that other Rust
+/// code — not just this crate's own build pipeline — can register ament index
+/// resources directly, the same way any CMakeLists.txt can call
+/// `ament_index_register_resource()` directly.
+///
 /// For more information:
 /// - Design doc: https://github.com/ament/ament_cmake/blob/2366f15479e37d552d4e225f09ccef1c6ccc8c4e/ament_cmake_core/doc/resource_index.md
 /// - Reference implementation of CMake: https://github.com/ament/ament_cmake/blob/2366f15479e37d552d4e225f09ccef1c6ccc8c4e/ament_cmake_core/cmake/index/ament_index_register_resource.cmake
-pub fn create_package_marker(
+pub fn register_resource(
     install_base: impl AsRef<Path>,
-    marker_dir: &str,
+    resource_type: &str,
     package_name: &str,
+    content: &str,
 ) -> Result<()> {
     let mut path = install_base
         .as_ref()
         .join("share/ament_index/resource_index");
-    path.push(marker_dir);
+    path.push(resource_type);
     DirBuilder::new()
         .recursive(true)
         .create(&path)
@@ -154,8 +169,18 @@ pub fn create_package_marker(
         })?;
     path.push(package_name);
     File::create(&path)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
         .with_context(|| format!("Failed to create package marker '{}'", path.display()))?;
     Ok(())
+}
+
+/// Register a package name with the ament index's `packages` resource type.
+///
+/// Direct Rust equivalent of CMake's `ament_index_register_package()`, which is
+/// itself just `ament_index_register_resource("packages", ...)` — this is the
+/// same one-line wrapper around [`register_resource`].
+pub fn register_package(install_base: impl AsRef<Path>, package_name: &str) -> Result<()> {
+    register_resource(install_base, "packages", package_name, "")
 }
 
 /// Copies files or directories recursively.
@@ -358,6 +383,70 @@ pub fn install_files_from_metadata(
     Ok(())
 }
 
+/// Register ament index resources declared under
+/// `[package.metadata.ros.ament_index_resources]`, mirroring CMake's
+/// `ament_index_register_resource(<type> [CONTENT <string>] [CONTENT_FILE <path>])`.
+///
+/// Each key in the table is an ament resource type (e.g. `test_resource` );
+/// each value is either the literal marker content as a string, or a
+/// table `{ content_file = "<path>" }` naming a file (relative to the directory
+/// containing `Cargo.toml`) whose contents are used verbatim as the marker
+/// content. The caller is responsible for formatting that content exactly as the
+/// resource type's consumer expects (e.g. `;`-joined vs. newline-terminated
+/// paths) — there is no single universal convention across resource types, so
+/// none is assumed here.
+///
+/// This does not install any files: resource types generally index files that
+/// also need installing under `share/<package_name>/`, `lib/<package_name>/` etc.
+/// — use `install_to_share`/`install_to_lib`/`install_to_include` (see
+/// [`install_files_from_metadata`]) for that.
+pub fn install_ament_index_resources(
+    install_base: impl AsRef<Path>,
+    package_path: impl AsRef<Path>,
+    package_name: &str,
+    metadata: Option<&Value>,
+) -> Result<()> {
+    let metadata_table = match metadata {
+        Some(Value::Table(tab)) => tab,
+        _ => return Ok(()),
+    };
+    let metadata_ros_table = match metadata_table.get("ros") {
+        Some(Value::Table(tab)) => tab,
+        _ => return Ok(()),
+    };
+    let resources_table = match metadata_ros_table.get("ament_index_resources") {
+        Some(Value::Table(tab)) => tab,
+        Some(_) => bail!("The [package.metadata.ros.ament_index_resources] entry is not a table"),
+        None => return Ok(()),
+    };
+
+    for (resource_type, entry) in resources_table {
+        let content = match entry {
+            Value::String(content) => content.clone(),
+            Value::Table(tab) => match tab.get("content_file") {
+                Some(Value::String(rel_path)) => {
+                    let path = package_path.as_ref().join(rel_path);
+                    std::fs::read_to_string(&path).with_context(|| {
+                        format!(
+                            "Could not read content_file '{}' for [package.metadata.ros.ament_index_resources.{resource_type}]",
+                            path.display()
+                        )
+                    })?
+                }
+                _ => bail!(
+                    "[package.metadata.ros.ament_index_resources.{resource_type}] table must have a string 'content_file' entry"
+                ),
+            },
+            _ => bail!(
+                "[package.metadata.ros.ament_index_resources.{resource_type}] must be a string, or a table with a 'content_file' entry"
+            ),
+        };
+
+        register_resource(&install_base, resource_type, package_name, &content)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,17 +456,54 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_create_package_marker() -> Result<()> {
+    fn test_register_resource() -> Result<()> {
         let tmp = tempdir()?;
         let install_base = tmp.path();
 
-        create_package_marker(install_base, "packages", "test_package")?;
+        register_resource(install_base, "packages", "test_package", "")?;
 
         let marker_path =
             install_base.join("share/ament_index/resource_index/packages/test_package");
 
         assert!(marker_path.exists());
         assert!(marker_path.is_file());
+        assert_eq!(std::fs::read_to_string(&marker_path)?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_resource_with_content() -> Result<()> {
+        let tmp = tempdir()?;
+        let install_base = tmp.path();
+
+        register_resource(
+            install_base,
+            "test_resource",
+            "test_package",
+            "test_resource/foo.yaml;test_resource/bar.yaml",
+        )?;
+
+        let marker_path =
+            install_base.join("share/ament_index/resource_index/test_resource/test_package");
+
+        assert_eq!(
+            std::fs::read_to_string(&marker_path)?,
+            "test_resource/foo.yaml;test_resource/bar.yaml"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_package() -> Result<()> {
+        let tmp = tempdir()?;
+        let install_base = tmp.path();
+
+        register_package(install_base, "test_package")?;
+
+        let marker_path =
+            install_base.join("share/ament_index/resource_index/packages/test_package");
+
+        assert_eq!(std::fs::read_to_string(&marker_path)?, "");
         Ok(())
     }
 
@@ -555,6 +681,75 @@ mod tests {
         install_files_from_metadata(&install_base, &package_path, "pkg", Some(&metadata_table))?;
 
         assert!(install_base.join("share/pkg/launch/robot.py").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_ament_index_resources_literal_content() -> Result<()> {
+        let tmp = tempdir()?;
+        let package_path = tmp.path().join("pkg");
+        let install_base = tmp.path().join("install");
+        std::fs::create_dir_all(&package_path)?;
+
+        /* Create serialized metadata akin to:
+        ```toml
+        [package.metadata.ros.ament_index_resources]
+        test_resource = "module/foo.yaml"
+        ```
+        */
+        let ament_index_resources: HashMap<&str, Value> =
+            HashMap::from([("test_resource", Value::from("module/foo.yaml"))]);
+        let ros_table: HashMap<&str, Value> =
+            HashMap::from([("ament_index_resources", Value::from(ament_index_resources))]);
+        let metadata_table_entries: HashMap<&str, Value> =
+            HashMap::from([("ros", Value::from(ros_table))]);
+        let metadata_table = cargo_manifest::Value::from(metadata_table_entries);
+
+        install_ament_index_resources(&install_base, &package_path, "pkg", Some(&metadata_table))?;
+
+        assert_eq!(
+            std::fs::read_to_string(
+                install_base.join("share/ament_index/resource_index/test_resource/pkg")
+            )?,
+            "module/foo.yaml"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_ament_index_resources_content_file() -> Result<()> {
+        let tmp = tempdir()?;
+        let package_path = tmp.path().join("pkg");
+        let install_base = tmp.path().join("install");
+        std::fs::create_dir_all(&package_path)?;
+
+        let mut content_file = File::create(package_path.join("sound_manifest.txt"))?;
+        content_file.write_all(b"sounds/beep.wav\nsounds/click.ogg\n")?;
+
+        /* Create serialized metadata akin to:
+        ```toml
+        [package.metadata.ros.ament_index_resources]
+        sound = { content_file = "sound_manifest.txt" }
+        ```
+        */
+        let sound_entry: HashMap<&str, Value> =
+            HashMap::from([("content_file", Value::from("sound_manifest.txt"))]);
+        let ament_index_resources: HashMap<&str, Value> =
+            HashMap::from([("sound", Value::from(sound_entry))]);
+        let ros_table: HashMap<&str, Value> =
+            HashMap::from([("ament_index_resources", Value::from(ament_index_resources))]);
+        let metadata_table_entries: HashMap<&str, Value> =
+            HashMap::from([("ros", Value::from(ros_table))]);
+        let metadata_table = cargo_manifest::Value::from(metadata_table_entries);
+
+        install_ament_index_resources(&install_base, &package_path, "pkg", Some(&metadata_table))?;
+
+        assert_eq!(
+            std::fs::read_to_string(
+                install_base.join("share/ament_index/resource_index/sound/pkg")
+            )?,
+            "sounds/beep.wav\nsounds/click.ogg\n"
+        );
         Ok(())
     }
 }
