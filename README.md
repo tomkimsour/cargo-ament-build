@@ -18,4 +18,15 @@ These paths are relative to the directory containing the `Cargo.toml` file and w
 
 The same mechanism applies with `install_to_include` and `install_to_lib`.
 
-Target types other than libraries and binaries (i.e. benches, tests) are not yet installed.
+It is also possible to register arbitrary ament index resources, by
+specifying the resource type and its marker content like this:
+```
+[package.metadata.ros.ament_index_resources]
+test_resource = "test_resource/foo.yaml"
+sound = { content_file = "sounds/manifest.txt" }
+```
+Each key is an ament resource type; each value is either the
+literal marker content as a string, or a table `{ content_file = "<path>" }` naming a file
+relative to the directory containing `Cargo.toml`. A
+marker file is created at `share/ament_index/resource_index/<resource type>/<package_name>`
+with exactly that content.
