@@ -13,6 +13,7 @@ keywords = ["ros2", "colcon", "ament"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ament_rs = "0.3.0"
 anyhow = "1"
 cargo-manifest = "0.19"
 pico-args = "0.4"
